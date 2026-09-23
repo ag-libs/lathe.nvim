@@ -29,6 +29,9 @@ local SELECTOR_KIND = {
 -- Innermost first: the first kind whose range contains the cursor is the one to debug.
 local PRECEDENCE = { TEST_METHOD, TEST_CLASS, TEST_PACKAGE }
 
+-- Run tokens of in-flight Lathe debug sessions, so :LatheRunStop can cancel their replay JVMs.
+local active_tokens = {}
+
 local function lathe_client()
   return vim.lsp.get_clients({ name = "lathe" })[1]
 end
@@ -101,6 +104,18 @@ function M._main_config_for(target)
   }
 end
 
+--- The attach config for a saved config selected by name: the server resolves its module and target,
+--- so the client forwards only the name (lathe_config_name routes the adapter to lathe.debug.named).
+function M._named_config_for(name)
+  return {
+    type = "lathe",
+    request = "attach",
+    name = "Lathe: debug " .. name,
+    lathe_config_name = name,
+    lathe_token = output.next_token(),
+  }
+end
+
 --- nvim-dap adapter: launches the suspended debuggee via lathe.debug.test / lathe.debug.main and
 --- resolves to a `server` adapter on the returned DAP port. enrich_config runs on this resolved
 --- adapter (after this callback), so the JDWP port lands in the attach request without a port
@@ -113,8 +128,15 @@ local function start_adapter(callback, config)
     return
   end
 
+  -- Track the run token so :LatheRunStop can cancel this debug replay directly (M.stop), rather than
+  -- relying on the attach adapter's terminate semantics. Cleared when the session ends.
+  active_tokens[config.lathe_token] = true
+
   local command, argument
-  if config.lathe_main_class then
+  if config.lathe_config_name then
+    command = "lathe.debug.named"
+    argument = { name = config.lathe_config_name, token = config.lathe_token }
+  elseif config.lathe_main_class then
     command = "lathe.debug.main"
     argument = {
       moduleRel = config.lathe_module_rel,
@@ -214,6 +236,59 @@ function M.debug(bufnr)
   end, bufnr)
 end
 
+--- Debugs a saved config selected by name (cursor-independent), via nvim-dap's attach flow. The
+--- server resolves the config's target and launch mode, so run and debug share one saved entry.
+function M.debug_named(name)
+  local ok, dap = pcall(require, "dap")
+  if not ok then
+    notify("nvim-dap not installed", vim.log.levels.ERROR)
+    return
+  end
+
+  if not lathe_client() then
+    notify("server not attached to this buffer", vim.log.levels.WARN)
+    return
+  end
+
+  dap.run(M._named_config_for(name))
+end
+
+--- Stops any in-flight Lathe debug session by cancelling its replay JVM directly (lathe.run.cancel) --
+--- the same reliable server path a normal run uses, rather than depending on the attach adapter's
+--- terminate semantics. Killing the JVM makes DAP emit exited/terminated (tearing down the UI); a
+--- dap.terminate() follows as belt-and-suspenders cleanup. Returns true if it stopped anything, so
+--- :LatheRunStop can fall through to the normal-run stop when there was no debug session.
+function M.stop()
+  local tokens = {}
+  for token in pairs(active_tokens) do
+    tokens[#tokens + 1] = token
+  end
+
+  if #tokens == 0 then
+    return false
+  end
+
+  local client = lathe_client()
+  for _, token in ipairs(tokens) do
+    active_tokens[token] = nil
+    if client then
+      client:request("workspace/executeCommand", {
+        command = "lathe.run.cancel",
+        arguments = { { token = token } },
+      })
+    end
+  end
+
+  local ok, dap = pcall(require, "dap")
+  if ok then
+    pcall(function()
+      dap.terminate({}, { terminateDebuggee = true })
+    end)
+  end
+
+  return true
+end
+
 -- Once a Lathe debug session ends, hyperlink the stack frames the debuggee streamed into the
 -- shared output buffer -- the debug twin of lathe.run's on_finished / lathe.neotest's results(),
 -- which both call this after their run completes. The debug launch request returns at attach
@@ -224,6 +299,10 @@ end
 -- testable without a live nvim-dap session.
 function M._decorate_on_session_end(session)
   if session and session.config and session.config.type == "lathe" then
+    if session.config.lathe_token then
+      active_tokens[session.config.lathe_token] = nil
+    end
+
     stackdecorate.decorate_live_output()
   end
 end

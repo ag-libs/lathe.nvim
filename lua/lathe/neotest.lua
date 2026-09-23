@@ -491,30 +491,6 @@ function M.discover_positions(file_path)
   return build_tree(file_path, targets)
 end
 
---- Derives {moduleRel, package} from a directory path, mirroring how Maven's
---- own layout (and RunnableScanner.packageName() server-side) resolve package
---- identity from source layout: <module>/src/(test|main)/java/<package/as/dirs>.
---- Pure and workspace_root-parameterized (no M.root() call inside) so it's
---- directly unit-testable. Returns nil for anything that doesn't match that
---- shape -- the module root itself, a path above src/, a non-Maven-standard
---- layout, or the default/unnamed package (RunnableScanner.emitPackageOnce
---- skips that one too) -- so build_spec can safely fall back to neotest's own
---- decomposition instead of guessing at a selector that might run the wrong
---- (or nothing at all) thing.
-function M._package_for_dir(dir_path, workspace_root)
-  local module_abs, package_path = dir_path:match("^(.-)/src/[^/]+/java/(.*)$")
-  if not module_abs or package_path == "" then
-    return nil
-  end
-
-  if not vim.startswith(module_abs, workspace_root) then
-    return nil
-  end
-  local module_rel = module_abs:sub(#workspace_root + 2)
-  local package_name = package_path:gsub("/", ".")
-  return module_rel, package_name
-end
-
 --- Builds a spec that runs one or more selectors (a method, class, a package for a directory, or
 --- every class in a file) in a single replay JVM, without blocking: the run is fired asynchronously
 --- and its per-test results stream in via lathe/testEvent, so neotest can mark positions live.
@@ -549,6 +525,7 @@ local function run_spec(position_id, module_rel, selections, client, label, stra
       token = token,
       result_future = result_future,
       label = label,
+      module_rel = module_rel,
       started = vim.uv.hrtime(),
     },
     stream = stream_fn(queue),
@@ -613,29 +590,36 @@ function M.build_spec(args)
   end
 
   if pos.type == "dir" then
-    -- A directory is a Java package 1:1 in standard Maven layout -- bind
-    -- running it to a single PACKAGE-selector run (selectPackage resolves
-    -- against the real classpath and already includes subpackages
-    -- recursively, so this covers everything under the directory in one
-    -- JVM launch) instead of letting neotest fall through to running every
-    -- file underneath individually. Falls back to normal decomposition
-    -- (return nil) for anything that doesn't look like a package directory.
-    local workspace_root = M.root(pos.path)
-    if not workspace_root then
+    -- What to run for a directory (a package, a whole module in one launch, or nothing for the
+    -- reactor root) is resolved server-side from the real reactor layout: the client parses no
+    -- paths and needs no attribution, so it works even for a never-opened module. Blocking
+    -- round-trip in neotest's async run context, like discover_positions' runnables.list call.
+    local err, run = client.request.workspace_executeCommand({
+      command = "lathe.runnables.dir",
+      arguments = { { uri = vim.uri_from_fname(pos.path) } },
+    })
+    if not err and run and run.selections and #run.selections > 0 then
+      -- Key on the dir node's id (not a package name, which matches no node) so results()' fan-out
+      -- lands the aggregate here and clears every descendant; per-test statuses still win.
+      return run_spec(pos.id, run.moduleRel, run.selections, client, pos.name, strategy)
+    end
+
+    if strategy == "dap" then
+      vim.notify("Nothing here to debug", vim.log.levels.WARN, { title = "Lathe" })
       return nil
     end
-    local module_rel, package_name = M._package_for_dir(pos.path, workspace_root)
-    if not module_rel then
-      return nil
-    end
-    -- The run position is the directory node's own id (its path), NOT the package name: the package
-    -- name is only the PACKAGE selector value and matches no node, so keying the run on it orphans
-    -- the aggregate result and skips results()' subtree fan-out -- leaving the directory glyph stale
-    -- (e.g. a red left over from a prior run never clears). pos.id lands the aggregate on the real
-    -- directory node and lets the fan-out clear/update every descendant; per-test statuses still win.
-    return run_spec(pos.id, module_rel, {
-      { selectorKind = "PACKAGE", selectorValue = package_name },
-    }, client, package_name, strategy)
+
+    -- Not a single run target (reactor root, or a dir with no tests). A no-op skip fires results()
+    -- and clears the glyph honestly, instead of neotest's per-file decomposition -- which runs only
+    -- already-opened files and reports a misleading green for every test it never ran.
+    return {
+      command = { "true" },
+      context = {
+        position_id = pos.id,
+        skip_reason = "no runnable tests here — run a module, package, or file",
+        label = pos.name,
+      },
+    }
   end
 
   if pos.type ~= "file" then
@@ -707,8 +691,9 @@ end
 local STATUS_RANK = { skipped = 1, passed = 2, failed = 3 }
 
 --- FQCN for a `*Test.java` file, or the dotted package for a test source directory, derived from its
---- absolute path (mirrors _package_for_dir's `/src/<scope>/java/` anchor). nil for a path outside a test
---- source root, so a non-standard-layout node falls back to the aggregate rather than mis-matching.
+--- absolute path anchored on `/src/<scope>/java/`. nil for a path outside a test source root, so a
+--- non-standard-layout node falls back to the aggregate rather than mis-matching. This name matching
+--- (results -> tree nodes) is a client-side concern; deciding what to RUN is server-resolved.
 local function path_to_qualified(path)
   local rel = path:match("^.-/src/[^/]+/java/(.*)$")
   if not rel then
@@ -858,6 +843,11 @@ end
 local failing = {}
 M._failing = failing
 
+-- The most recent run's full executed-test set (set in results()): { label, module_rel, results },
+-- where results is the raw testResults list -- every method that ran, including files never opened
+-- into the neotest tree. open_results turns it into a quickfix. nil until the first run.
+local last_run = nil
+
 local function failing_index(id)
   for i, existing in ipairs(failing) do
     if existing == id then
@@ -1001,6 +991,9 @@ function M.results(spec, result, tree)
   -- run and debug (both reach results() with a reconciled outcome).
   if ctx.outcome and ctx.outcome.testResults then
     update_failing(ctx.outcome.testResults, real, tree)
+    -- Remember the run's full executed-test set (every method that actually ran, incl. never-opened
+    -- files -- see open_results) so <leader>tq can list it. The summary tree only shows opened files.
+    last_run = { label = ctx.label, module_rel = ctx.module_rel, results = ctx.outcome.testResults }
   end
 
   -- One completion toast per run (NV-2), fired here so it covers both run and debug (both reach
@@ -1031,6 +1024,76 @@ function M.run_first_failed()
   end
 
   M._run_position(failing[1])
+end
+
+-- Quickfix `type` per status: a failure is an error row, a skip a warning, a pass unadorned.
+local QF_TYPE = { failed = "E", skipped = "W", passed = "" }
+
+--- Quickfix items for a run's executed tests: failures first (each pointing at its failure line),
+--- then the rest in run order. `paths` maps className -> source file path; an unresolved class
+--- (empty path) becomes a text-only row (still listed, just not jumpable). No LSP round-trip, so it
+--- is unit-testable.
+function M._results_qf_items(results, paths)
+  local failures, others = {}, {}
+  for _, tr in ipairs(results or {}) do
+    local id = tr.className .. "#" .. tr.methodName
+    local failed = tr.status == "failed"
+    local message = failed and tr.failureMessage and tr.failureMessage ~= "" and tr.failureMessage
+      or nil
+    local text = message and (id .. " — " .. message:gsub("%s+", " ")) or (id .. " — " .. tr.status)
+    local item = { text = text, type = QF_TYPE[tr.status] or "" }
+    local path = paths[tr.className]
+    if path and path ~= "" then
+      item.filename = path
+      item.lnum = (failed and tr.failureLine and tr.failureLine > 0) and tr.failureLine or 1
+      item.col = 1
+    end
+
+    local bucket = failed and failures or others
+    bucket[#bucket + 1] = item
+  end
+
+  return vim.list_extend(failures, others)
+end
+
+--- Lists the last run's executed tests in the quickfix window, failures first and jumpable -- even
+--- tests in files never opened into the summary tree (the tree only shows opened files, but the run
+--- executed the whole module). className -> source path is resolved server-side (lathe.testSources,
+--- pure path math, no attribution). Reflects the last run; the next run replaces it. Bind <leader>tq.
+function M.open_results()
+  local run = last_run
+  if not run or #run.results == 0 then
+    vim.notify("No test run to show yet", vim.log.levels.WARN, { title = "Lathe" })
+    return
+  end
+
+  nio().run(function()
+    local paths = {}
+    local client = lathe_client()
+    if client and run.module_rel then
+      -- The server dedups classNames (its testSources returns one entry per class), so collect them
+      -- as-is rather than deduping here too.
+      local names = {}
+      for _, tr in ipairs(run.results) do
+        names[#names + 1] = tr.className
+      end
+      local err, sources = client.request.workspace_executeCommand({
+        command = "lathe.testSources",
+        arguments = { { moduleRel = run.module_rel, classNames = names } },
+      })
+      if not err and sources then
+        for _, source in ipairs(sources) do
+          paths[source.className] = source.path
+        end
+      end
+    end
+
+    local items = M._results_qf_items(run.results, paths)
+    vim.schedule(function()
+      vim.fn.setqflist({}, " ", { title = "Lathe tests: " .. (run.label or ""), items = items })
+      vim.cmd("copen")
+    end)
+  end)
 end
 
 return M

@@ -20,6 +20,11 @@
 --   continuation_indent number; pins the wrapped-line continuation width (default: twice the block width).
 --   formatter           nil | "google"; enables on-demand Google Java Format via the server (default: nil).
 --   format_on_save      boolean; format on write; only wired when formatter == "google" (default: false).
+--   pom                 table; client-side pom.xml support via `xmllint` (no server involvement):
+--                       { validate = true, format = false }. validate publishes XSD diagnostics on
+--                       open/save (default on); format points `formatprg` at `xmllint --format` for
+--                       `gq` (default off). Pass { validate = false } to disable. Needs `xmllint`
+--                       (libxml2) on PATH; degrades to a one-time notice otherwise.
 --
 -- Set LATHE_DEBUG=1 in the environment to enable debug logging in the server process.
 -- Requires the Java Treesitter parser for indentation (:TSInstall java).
@@ -141,8 +146,16 @@ end
 
 -- On-demand formatting that keeps a closed imports fold from springing open (NV-3). Map a format
 -- key to this instead of raw vim.lsp.buf.format, which reopens the fold on the buffer rewrite.
+-- A pom.xml has no server formatter, so it routes client-side through xmllint; every other buffer
+-- goes through the fold-preserving google-java-format path.
 function M.format(bufnr, opts)
-  require('lathe.fold').format(bufnr or vim.api.nvim_get_current_buf(), opts)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if vim.fs.basename(vim.api.nvim_buf_get_name(bufnr)) == 'pom.xml' then
+    require('lathe.pom').format_buffer(bufnr)
+    return
+  end
+
+  require('lathe.fold').format(bufnr, opts)
 end
 
 -- Nudge for the standalone install's silent failure modes, which the bundled cache
@@ -321,6 +334,7 @@ function M.setup(opts)
       local client = vim.lsp.get_client_by_id(args.data.client_id)
       if client and client.name == 'lathe' then
         run.refresh_signs(args.buf)
+        run.refresh_configs()
       end
     end,
   })
@@ -333,12 +347,55 @@ function M.setup(opts)
       end
     end,
   })
-  vim.api.nvim_create_user_command('LatheRun', function()
-    run.run(vim.api.nvim_get_current_buf())
-  end, { desc = 'Lathe: run the main class in the current buffer' })
+  -- A hand-edited run config (either layer) refreshes the completion/picker cache without a
+  -- re-attach. The `run.json` pattern is a basename match (fires for any run.json), so the callback
+  -- narrows it to Lathe's own files: the reactor-root lathe-run.json or a `.lathe/run.json`. Absent
+  -- configs (or no attached client) make refresh_configs a harmless no-op.
+  vim.api.nvim_create_autocmd('BufWritePost', {
+    group = augroup,
+    pattern = { 'lathe-run.json', 'run.json' },
+    callback = function(ev)
+      local name = ev.file or ''
+      if name:match('/%.lathe/run%.json$') or vim.fs.basename(name) == 'lathe-run.json' then
+        run.refresh_configs()
+      end
+    end,
+  })
+  vim.api.nvim_create_user_command('LatheRun', function(cmd)
+    if cmd.args ~= '' then
+      run.run_named(cmd.args)
+    else
+      run.run(vim.api.nvim_get_current_buf())
+    end
+  end, {
+    nargs = '?',
+    complete = function(arglead)
+      return run.complete_config(arglead)
+    end,
+    desc = 'Lathe: run the buffer main, or a saved config by name',
+  })
   vim.api.nvim_create_user_command('LatheRunStop', function()
-    run.stop()
-  end, { desc = 'Lathe: stop the active main run' })
+    -- Stop a debug session if one is live (cancels its replay JVM directly); otherwise the run.
+    if not require('lathe.dap').stop() then
+      run.stop()
+    end
+  end, { desc = 'Lathe: stop the active run or debug session' })
+  vim.api.nvim_create_user_command('LatheRunLast', function()
+    run.run_last()
+  end, { desc = 'Lathe: re-run the last run config' })
+  vim.api.nvim_create_user_command('LatheRunSave', function(cmd)
+    run.save(cmd.args ~= '' and cmd.args or nil, cmd.bang)
+  end, {
+    nargs = '?',
+    bang = true,
+    complete = function(arglead)
+      return run.complete_config(arglead)
+    end,
+    desc = 'Lathe: save the runnable under the cursor as a named config (! overwrites)',
+  })
+  vim.api.nvim_create_user_command('LatheRunOutput', function()
+    require('lathe.output').open()
+  end, { desc = 'Lathe: toggle the run output console' })
 
   -- New-type surface: :LatheNew scaffolds a class/interface/record/enum through the server (which
   -- owns placement, skeleton, and caret) and opens the returned file.
@@ -364,14 +421,29 @@ function M.setup(opts)
   -- changes. The server never runs Maven itself.
   require('lathe.sync').setup()
 
+  -- pom.xml surface: client-side XSD validation (diagnostics on open/save) and optional formatting,
+  -- both via `xmllint`. No language server involvement -- Lathe is never attached to pom.xml. On by
+  -- default; pass `pom = { validate = false }` to disable, `pom = { format = true }` for `gq`.
+  require('lathe.pom').setup(opts.pom)
+
   -- Debug surface: :LatheDebug attaches nvim-dap to the test or main class under the cursor,
   -- replayed under a suspended JDWP agent (server-side lathe.debug.test / lathe.debug.main).
   -- Optional -- the command is only wired when nvim-dap is present, so a runtime without it loads
   -- unaffected.
   if require('lathe.dap').setup() then
-    vim.api.nvim_create_user_command('LatheDebug', function()
-      require('lathe.dap').debug(vim.api.nvim_get_current_buf())
-    end, { desc = 'Lathe: debug the test under the cursor' })
+    vim.api.nvim_create_user_command('LatheDebug', function(cmd)
+      if cmd.args ~= '' then
+        require('lathe.dap').debug_named(cmd.args)
+      else
+        require('lathe.dap').debug(vim.api.nvim_get_current_buf())
+      end
+    end, {
+      nargs = '?',
+      complete = function(arglead)
+        return run.complete_config(arglead)
+      end,
+      desc = 'Lathe: debug the cursor target, or a saved config by name',
+    })
   end
 
   local cache_pattern = root .. '/**'
