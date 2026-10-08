@@ -6,7 +6,7 @@
 
 The Neovim client for [Lathe](https://github.com/ag-libs/lathe). This repository is a **generated,
 one-way mirror** of the client that lives in the Lathe monorepo
-(`lathe-maven-plugin/src/main/neovim`). Bug reports are welcome here as issues, but **code changes are
+(`lathe-neovim/runtime`). Bug reports are welcome here as issues, but **code changes are
 accepted only in the [monorepo](https://github.com/ag-libs/lathe)** — a pull request opened here can't
 be merged back into the source.
 

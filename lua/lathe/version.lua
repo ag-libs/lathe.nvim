@@ -4,6 +4,6 @@
 -- only on a breaking client<->server contract change (executeCommand names,
 -- init_options shape, custom notifications) -- not on every release.
 return {
-  VERSION = '0.1.15',
+  VERSION = '0.1.16',
   PROTOCOL = 1,
 }
