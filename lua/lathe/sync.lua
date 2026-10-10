@@ -1,7 +1,7 @@
--- Handles the server's `lathe/sync` notification (and the `:LatheSync` command) by running Maven for
--- the workspace so the `.lathe/` mirror and captured launch templates refresh. The server never runs
--- Maven itself; it only asks the client to. `captureTests` selects `mvn test` (which re-captures
--- test-launch.json for neotest) over the lighter `mvn process-test-classes`.
+-- Handles the server's `lathe/sync` notification (and the `:LatheSync` command) by running the
+-- workspace's `.lathe/lathe-sync.sh`, which the build wrote, so the `.lathe/` mirror and captured
+-- launch templates refresh. Neither the server nor this client knows the build tool: the script does.
+-- `captureTests` passes `--tests` (re-capture test-launch.json for neotest); `modules` scope it.
 --
 -- Presentation: while the build runs, a transient "syncing… Ns" toast (carrying the command) is
 -- refreshed every couple of seconds; on completion it becomes a one-line success summary. Both
@@ -62,7 +62,7 @@ local function ensure_output_buf()
   pcall(vim.api.nvim_buf_set_name, out_buf, 'Lathe Sync Output')
   vim.keymap.set('n', 'r', function()
     if last_sync then
-      M.run_maven(last_sync.root, last_sync.capture_tests, last_sync.modules)
+      M.run(last_sync.root, last_sync.capture_tests, last_sync.modules)
     end
   end, { buffer = out_buf, desc = 'Lathe: re-run the last sync' })
   vim.keymap.set(
@@ -149,22 +149,13 @@ local function release_lock(root)
   pcall(vim.loop.fs_unlink, lock_path(root))
 end
 
---- The fastest/most-faithful Maven available: the mvnd daemon, else the project's ./mvnw wrapper,
---- else plain mvn on PATH.
-local function maven_executable(root)
-  if vim.fn.executable('mvnd') == 1 then
-    return 'mvnd'
-  end
-  local wrapper = root .. '/mvnw'
-  if vim.fn.executable(wrapper) == 1 then
-    return wrapper
-  end
-  return 'mvn'
-end
+-- The notification names what the client ran; the script prints the build command it resolves
+-- (`lathe-sync: mvnd …`) as its first stderr line, so that shows in the output console.
+local SCRIPT = '.lathe/lathe-sync.sh'
 
---- Runs `mvn <goal>` at `root` as a background job, notifying on start and completion. `modules` (a
---- list of reactor-relative paths) narrows it to `-pl <modules> -am`; empty/nil is a full reactor.
-function M.run_maven(root, capture_tests, modules)
+--- Runs `.lathe/lathe-sync.sh [--tests] [module ...]` at `root` as a background job, notifying on
+--- start and completion. `modules` (reactor-relative paths) scope it; empty/nil syncs everything.
+function M.run(root, capture_tests, modules)
   if not root or root == '' then
     return
   end
@@ -173,16 +164,19 @@ function M.run_maven(root, capture_tests, modules)
     return
   end
 
-  local goal = capture_tests and 'test' or 'process-test-classes'
-  -- --no-transfer-progress drops the download chatter; the build cache is disabled so the sync always
-  -- reproduces the outputs Lathe mirrors from `.lathe/`.
-  local cmd =
-    { maven_executable(root), '--no-transfer-progress', '-Dmaven.build.cache.enabled=false' }
-  if modules and #modules > 0 then
-    vim.list_extend(cmd, { '-pl', table.concat(modules, ','), '-am' })
+  local script = vim.fs.joinpath(root, SCRIPT)
+  if vim.fn.executable(script) ~= 1 then
+    vim.notify(
+      'Lathe: `.lathe/` has no sync script -- the workspace was synced by an older Lathe. Update '
+        .. 'lathe-maven-extension and run `mvn process-test-classes` once.',
+      vim.log.levels.WARN
+    )
+    return
   end
-  table.insert(cmd, goal)
-  local cmd_str = table.concat(cmd, ' ')
+
+  local args = vim.list_extend(capture_tests and { '--tests' } or {}, modules or {})
+  local cmd = vim.list_extend({ script }, args)
+  local cmd_str = table.concat(vim.list_extend({ SCRIPT }, args), ' ')
   running[root] = true
   last_sync = { root = root, capture_tests = capture_tests, modules = modules }
 
@@ -230,24 +224,24 @@ end
 
 local function sync_current(capture_tests)
   local root = require('lathe').get_root(vim.api.nvim_get_current_buf())
-  M.run_maven(root, capture_tests)
+  M.run(root, capture_tests)
 end
 
 --- Registers the `lathe/sync` handler and the `:LatheSync` / `:LatheSyncCaptureTest` / retry commands.
 function M.setup()
   vim.lsp.handlers['lathe/sync'] = function(_err, result)
     if result then
-      M.run_maven(result.workspaceRoot, result.captureTests, result.modules)
+      M.run(result.workspaceRoot, result.captureTests, result.modules)
     end
   end
 
   vim.api.nvim_create_user_command('LatheSync', function()
     sync_current(false)
-  end, { desc = 'Lathe: run mvn process-test-classes to refresh the workspace' })
+  end, { desc = 'Lathe: run .lathe/lathe-sync.sh to refresh the workspace' })
 
   vim.api.nvim_create_user_command('LatheSyncCaptureTest', function()
     sync_current(true)
-  end, { desc = 'Lathe: run mvn test to refresh the workspace and re-capture test launches' })
+  end, { desc = 'Lathe: run .lathe/lathe-sync.sh --tests to also re-capture test launches' })
 
   vim.api.nvim_create_user_command('LatheSyncOutput', function()
     if not open_output_window() then
