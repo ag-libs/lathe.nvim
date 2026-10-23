@@ -3,8 +3,8 @@
 -- Installation: copy this file (or symlink it) into your Neovim config and call:
 --   require('lathe').setup()
 --
--- The launcher is read from <root>/.lathe/lathe-launcher.sh, a symlink the build's Lathe sync
--- links at the server version this workspace pins.
+-- The launcher is read from <root>/.lathe/lathe-launcher.sh, which the build's Lathe sync writes
+-- for the server version this workspace pins.
 --
 -- For local server development, set LATHE_SERVER_DIR to a built server version directory (e.g.
 -- ~/.cache/lathe/servers/0.1.0-SNAPSHOT) to run that launcher instead of the workspace-pinned one,
@@ -38,7 +38,9 @@ local M = {}
 M.ROOT_MARKER = '.lathe'
 
 local function cache_root()
-  return vim.fs.normalize(vim.env.LATHE_CACHE or (vim.fn.expand('~') .. '/.cache/lathe'))
+  local root = vim.fs.normalize(vim.env.LATHE_CACHE or (vim.fn.expand('~') .. '/.cache/lathe'))
+  -- Buffer names are symlink-resolved, so prefix checks against them need the resolved cache dir.
+  return vim.uv.fs_realpath(root) or root
 end
 
 --- Absolute path to the server launcher this client execs. Honors the
@@ -189,6 +191,7 @@ function M.warn_if_not_ready(bufnr)
   elseif root == nil then
     msg = 'Lathe: no `.lathe/` workspace -- Lathe is not set up for this project, or it is not '
       .. 'synced yet: ' .. require('lathe.sync').SETUP_HINT .. ' Then `:LatheSync` refreshes it.'
+      .. ' If a build already ran, its log says why: Lathe needs Maven 3.6.3+.'
   else
     msg = 'Lathe: `.lathe/` has no server launcher -- the workspace was synced by an older Lathe. '
       .. 'Update the Lathe build plugin (Maven: lathe-maven-extension 0.1.16 or later) and sync again: '
